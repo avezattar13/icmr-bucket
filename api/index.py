@@ -1,9 +1,7 @@
 from fastapi import FastAPI, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import Response
-import pyarrow.dataset as ds
-import pyarrow.compute as pc
-from huggingface_hub import HfFileSystem
+import duckdb
 import os
 import time
 import json
@@ -20,19 +18,21 @@ app.add_middleware(
 )
 
 # --- Configuration ---
-# Updated to point to your new Bucket
-BUCKET_ID = "avezattar/1CMR-compact-bucket" 
+# We must use the direct Hugging Face URL because DuckDB queries over HTTP
 HF_TOKEN = os.getenv("hf_token") 
+BUCKET_BASE_URL = "https://huggingface.co/buckets/avezattar/1CMR-compact-bucket/resolve/main"
 
-global_fs = HfFileSystem(token=HF_TOKEN)
+# DuckDB requires the token in the Authorization header
+if HF_TOKEN:
+    HF_HEADERS = {"Authorization": f"Bearer {HF_TOKEN}"}
+else:
+    HF_HEADERS = {}
 
-# --- Paths for Buckets ---
-# Buckets use the 'buckets/' prefix, not 'datasets/'
-FILE_LIST = [f"buckets/{BUCKET_ID}/icmr_part0{i}.parquet" for i in range(1, 5)]
+FILE_LIST = [f"{BUCKET_BASE_URL}/icmr_part0{i}.parquet" for i in range(1, 5)]
 
 @app.get("/")
 def root():
-    return {"status": "online", "message": "1CMR API is Live."}
+    return {"status": "online", "message": "1CMR API is Live (DuckDB)."}
 
 @app.get("/search")
 def search(mobile: str = Query(..., description="10-digit mobile number")):
@@ -45,33 +45,34 @@ def search(mobile: str = Query(..., description="10-digit mobile number")):
                 media_type="application/json"
             )
 
-        # Load dataset from Bucket
-        dataset = ds.dataset(FILE_LIST, filesystem=global_fs, format="parquet")
+        # Initialize an in-memory DuckDB connection
+        con = duckdb.connect(database=':memory:')
         
-        # Prune columns to save memory (matches your screenshot schema)
-        columns_to_read = [
-            "name", "fathersName", "phoneNumber", "otherNumber",
-            "passportNumber", "aadharNumber", "age", "gender",
-            "address", "district", "pincode", "state", "town"
-        ]
+        # If the files are in a private bucket, we must set the Bearer token
+        if HF_TOKEN:
+            con.execute(f"CREATE SECRET hf_secret (TYPE HTTP, EXTRA_HTTP_HEADERS MAP {{'Authorization': 'Bearer {HF_TOKEN}'}});")
         
-        filter_expr = pc.equal(pc.field("phoneNumber"), mobile)
+        # Query the dataset directly over HTTP, filtering by phoneNumber
+        query = f"""
+            SELECT name, fathersName AS father_name, phoneNumber AS mobile, 
+                   otherNumber AS alternate_mobile, passportNumber AS passport_number, 
+                   aadharNumber AS aadhar_number, age, gender, address, 
+                   district, pincode, state, town
+            FROM read_parquet({FILE_LIST})
+            WHERE phoneNumber = ?
+            LIMIT 5
+        """
         
-        # Iterate in small batches to prevent Vercel OOM
-        scanner = dataset.scanner(
-            filter=filter_expr,
-            columns=columns_to_read,
-            use_threads=False,
-            batch_size=1024 
-        )
+        # Execute the query safely with parameter binding
+        result = con.execute(query, [mobile]).fetchall()
         
-        raw_records = []
-        # Break immediately upon finding a match
-        for batch in scanner.to_batches():
-            if batch.num_rows > 0:
-                raw_records = batch.to_pylist()
-                break
-                
+        # Get column names from the query
+        columns = [desc[0] for desc in con.description]
+        
+        raw_records = [dict(zip(columns, row)) for row in result]
+        
+        con.close()
+        
         elapsed = time.time() - start_time
         
         response_data = {
@@ -92,21 +93,7 @@ def search(mobile: str = Query(..., description="10-digit mobile number")):
             )
             
         for i, row in enumerate(raw_records, 1):
-            clean_row = {}
-            if row.get("name"): clean_row["name"] = row["name"]
-            if row.get("fathersName"): clean_row["father_name"] = row["fathersName"]
-            if row.get("phoneNumber"): clean_row["mobile"] = row["phoneNumber"]
-            if row.get("otherNumber"): clean_row["alternate_mobile"] = row["otherNumber"]
-            if row.get("passportNumber"): clean_row["passport_number"] = row["passportNumber"]
-            if row.get("aadharNumber"): clean_row["aadhar_number"] = row["aadharNumber"]
-            if row.get("age"): clean_row["age"] = row["age"]
-            if row.get("gender"): clean_row["gender"] = row["gender"]
-            if row.get("address"): clean_row["address"] = row["address"]
-            if row.get("district"): clean_row["district"] = row["district"]
-            if row.get("pincode"): clean_row["pincode"] = row["pincode"]
-            if row.get("state"): clean_row["state"] = row["state"]
-            if row.get("town"): clean_row["town"] = row["town"]
-            
+            clean_row = {k: v for k, v in row.items() if v is not None}
             clean_row["result_id"] = i
             response_data["results"].append(clean_row)
             
