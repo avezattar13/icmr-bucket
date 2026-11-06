@@ -18,15 +18,8 @@ app.add_middleware(
 )
 
 # --- Configuration ---
-# We must use the direct Hugging Face URL because DuckDB queries over HTTP
 HF_TOKEN = os.getenv("hf_token") 
 BUCKET_BASE_URL = "https://huggingface.co/buckets/avezattar/1CMR-compact-bucket/resolve/main"
-
-# DuckDB requires the token in the Authorization header
-if HF_TOKEN:
-    HF_HEADERS = {"Authorization": f"Bearer {HF_TOKEN}"}
-else:
-    HF_HEADERS = {}
 
 FILE_LIST = [f"{BUCKET_BASE_URL}/icmr_part0{i}.parquet" for i in range(1, 5)]
 
@@ -45,14 +38,28 @@ def search(mobile: str = Query(..., description="10-digit mobile number")):
                 media_type="application/json"
             )
 
-        # Initialize an in-memory DuckDB connection
+        # Initialize DuckDB connection
         con = duckdb.connect(database=':memory:')
         
-        # If the files are in a private bucket, we must set the Bearer token
-        if HF_TOKEN:
-            con.execute(f"CREATE SECRET hf_secret (TYPE HTTP, EXTRA_HTTP_HEADERS MAP {{'Authorization': 'Bearer {HF_TOKEN}'}});")
+        # FIX: Set the home directory to /tmp (writable in Vercel)
+        con.execute("SET home_directory='/tmp';")
         
-        # Query the dataset directly over HTTP, filtering by phoneNumber
+        # FIX: Install and load httpfs extension explicitly
+        # This is required to read files via https://
+        con.execute("INSTALL httpfs;")
+        con.execute("LOAD httpfs;")
+        
+        # If the files are in a private bucket, set the Bearer token
+        if HF_TOKEN:
+            # DuckDB uses HTTP secrets to attach headers to outgoing requests
+            con.execute(f"""
+                CREATE SECRET hf_secret (
+                    TYPE HTTP,
+                    EXTRA_HTTP_HEADERS MAP {{'Authorization': 'Bearer {HF_TOKEN}'}}
+                );
+            """)
+        
+        # Query the dataset directly over HTTP
         query = f"""
             SELECT name, fathersName AS father_name, phoneNumber AS mobile, 
                    otherNumber AS alternate_mobile, passportNumber AS passport_number, 
@@ -63,12 +70,8 @@ def search(mobile: str = Query(..., description="10-digit mobile number")):
             LIMIT 5
         """
         
-        # Execute the query safely with parameter binding
         result = con.execute(query, [mobile]).fetchall()
-        
-        # Get column names from the query
         columns = [desc[0] for desc in con.description]
-        
         raw_records = [dict(zip(columns, row)) for row in result]
         
         con.close()
