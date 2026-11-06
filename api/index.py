@@ -19,9 +19,10 @@ app.add_middleware(
 
 # --- Configuration ---
 HF_TOKEN = os.getenv("hf_token") 
-BUCKET_BASE_URL = "https://huggingface.co/buckets/avezattar/1CMR-compact-bucket/resolve/main"
 
-FILE_LIST = [f"{BUCKET_BASE_URL}/icmr_part0{i}.parquet" for i in range(1, 5)]
+# Use hf://buckets/ protocol for DuckDB Bucket support
+BUCKET_ID = "avezattar/1CMR-compact-bucket"
+FILE_LIST = [f"hf://buckets/{BUCKET_ID}/icmr_part0{i}.parquet" for i in range(1, 5)]
 
 @app.get("/")
 def root():
@@ -38,28 +39,20 @@ def search(mobile: str = Query(..., description="10-digit mobile number")):
                 media_type="application/json"
             )
 
-        # Initialize DuckDB connection
         con = duckdb.connect(database=':memory:')
         
-        # FIX: Set the home directory to /tmp (writable in Vercel)
+        # Set home directory for extension installation
         con.execute("SET home_directory='/tmp';")
         
-        # FIX: Install and load httpfs extension explicitly
-        # This is required to read files via https://
+        # Load httpfs for hf:// protocol support
         con.execute("INSTALL httpfs;")
         con.execute("LOAD httpfs;")
         
-        # If the files are in a private bucket, set the Bearer token
+        # Authenticate for private bucket access
         if HF_TOKEN:
-            # DuckDB uses HTTP secrets to attach headers to outgoing requests
-            con.execute(f"""
-                CREATE SECRET hf_secret (
-                    TYPE HTTP,
-                    EXTRA_HTTP_HEADERS MAP {{'Authorization': 'Bearer {HF_TOKEN}'}}
-                );
-            """)
+            con.execute(f"CREATE SECRET hf_token (TYPE huggingface, TOKEN '{HF_TOKEN}');")
         
-        # Query the dataset directly over HTTP
+        # Query using hf:// protocol
         query = f"""
             SELECT name, fathersName AS father_name, phoneNumber AS mobile, 
                    otherNumber AS alternate_mobile, passportNumber AS passport_number, 
